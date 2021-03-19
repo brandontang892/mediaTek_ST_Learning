@@ -1,204 +1,178 @@
-##################################################
-# Train a RAW-to-RGB model using training images #
-##################################################
+#################################
+# RAW-to-RGB Model architecture #
+#################################
 
 import tensorflow as tf
-import imageio
 import numpy as np
-import sys
-import matplotlib.pyplot as plt
-from datetime import datetime
 
-from load_dataset import load_train_patch, load_val_data
-from model import PUNET
-import utils
-import vgg
+#Increment this to make every layer have a different name
+layer_name = 0
 
-# Processing command arguments
-dataset_dir, model_dir, result_dir, vgg_dir, dslr_dir, phone_dir,\
-    arch, LEVEL, inst_norm, num_maps_base, restore_iter, patch_w, patch_h,\
-        batch_size, train_size, learning_rate, eval_step, num_train_iters, save_mid_imgs = \
-            utils.process_command_args(sys.argv)
+def PUNET(input, instance_norm=False, instance_norm_level_1=False, num_maps_base=16):
+    global layer_name
+    with tf.compat.v1.variable_scope("generator"):
 
-# Defining the size of the input and target image patches
-PATCH_WIDTH, PATCH_HEIGHT = patch_w//2, patch_h//2
+        # -----------------------------------------
+        # Downsampling layers
+        conv_l1_d1 = _conv_multi_block(input, 3, num_maps=num_maps_base, instance_norm=False)              # 128 -> 128
+        pool1 = max_pool(conv_l1_d1, 4)                                                         # 128 -> 32
 
-DSLR_SCALE = float(1) / (2 ** (max(LEVEL,0) - 1))
-TARGET_WIDTH = int(PATCH_WIDTH * DSLR_SCALE)
-TARGET_HEIGHT = int(PATCH_HEIGHT * DSLR_SCALE)
-TARGET_DEPTH = 3
-TARGET_SIZE = TARGET_WIDTH * TARGET_HEIGHT * TARGET_DEPTH
+        conv_l4_d1 = _conv_multi_block(pool1, 3, num_maps=num_maps_base*4, instance_norm=instance_norm)     # 32 -> 32
+        pool4 = max_pool(conv_l4_d1, 4)                                                      # 32 -> 8
 
-np.random.seed(0)
 
-# Defining the model architecture
-with tf.Graph().as_default(), tf.compat.v1.Session() as sess:
-    time_start = datetime.now()
+        # -----------------------------------------
+        # Processing: Level 5,  Input size: 8 x 8
+        conv_l5_d1 = _conv_multi_block(pool4, 3, num_maps=num_maps_base*16, instance_norm=instance_norm)
+        conv_l5_d2 = _conv_multi_block(conv_l5_d1, 3, num_maps=num_maps_base*16, instance_norm=instance_norm) + conv_l5_d1
+        conv_l5_d3 = _conv_multi_block(conv_l5_d2, 3, num_maps=num_maps_base*16, instance_norm=instance_norm) + conv_l5_d2
+        conv_l5_d4 = _conv_multi_block(conv_l5_d3, 3, num_maps=num_maps_base*16, instance_norm=instance_norm)
 
-    # mirrored_strategy = tf.distribute.MirroredStrategy()
-    # determine model name
-    if arch == "punet":
-        name_model = "punet"
-    
-    # Placeholders for training data
-    phone_ = tf.compat.v1.placeholder(tf.float32, [batch_size, PATCH_HEIGHT, PATCH_WIDTH, 4])
-    dslr_ = tf.compat.v1.placeholder(tf.float32, [batch_size, TARGET_HEIGHT, TARGET_WIDTH, TARGET_DEPTH])
+        conv_t4b = _conv_tranpose_layer(conv_l5_d4, num_maps_base*8, 3, 4)      # 8 -> 16
 
-    # Get the processed enhanced image
-    if arch == "punet":
-        enhanced = PUNET(phone_, instance_norm=inst_norm, instance_norm_level_1=False, num_maps_base=num_maps_base)
+        # -----------------------------------------
+        # Processing: Level 4,  Input size: 16 x 16
+        # conv_l4_d6 = conv_l4_d1
+        # conv_l4_d7 = stack(conv_l4_d6, conv_t4b)
+        # conv_l4_d8 = _conv_multi_block(conv_l4_d7, 3, num_maps=num_maps_base*8, instance_norm=instance_norm)
 
-    # Losses
-    enhanced_flat = tf.reshape(enhanced, [-1, TARGET_SIZE])
-    dslr_flat = tf.reshape(dslr_, [-1, TARGET_SIZE])
+        # conv_t3b = _conv_tranpose_layer(conv_l4_d8, num_maps_base*4, 3, 2)      # 16 -> 32
 
-    # MSE loss
-    loss_mse = tf.reduce_sum(tf.pow(dslr_flat - enhanced_flat, 2))/(TARGET_SIZE * batch_size)
+        # -----------------------------------------
+        # Processing: Level 3,  Input size: 32 x 32
+        conv_l3_d6 = conv_l4_d1
+        conv_l3_d7 = stack(conv_l3_d6, conv_t4b)
+        conv_l3_d8 = _conv_multi_block(conv_l3_d7, 3, num_maps=num_maps_base*4, instance_norm=instance_norm)
 
-    # PSNR loss
-    loss_psnr = 20 * utils.log10(1.0 / tf.sqrt(loss_mse))
+        conv_t2b = _conv_tranpose_layer(conv_l3_d8, num_maps_base*2, 3, 4)       # 32 -> 64
 
-    # SSIM loss
-    loss_ssim = tf.reduce_mean(tf.image.ssim(enhanced, dslr_, 1.0))
+        # updated until line 45
 
-    # MS-SSIM loss
-    loss_ms_ssim = tf.reduce_mean(tf.image.ssim_multiscale(enhanced, dslr_, 1.0))
+        # -------------------------------------------
+        # Processing: Level 2,  Input size: 64 x 64
+        # conv_l2_d7 = conv_l2_d1
+        # conv_l2_d8 = stack(_conv_multi_block(conv_l2_d7, 3, num_maps=num_maps_base*2, instance_norm=instance_norm), conv_t2b)
+        # conv_l2_d9 = _conv_multi_block(conv_l2_d8, 3, num_maps=num_maps_base*2, instance_norm=instance_norm)
 
-    # Content loss
-    CONTENT_LAYER = 'relu5_4'
+        # conv_t1b = _conv_tranpose_layer(conv_l2_d9, num_maps_base, 3, 2)       # 64 -> 128
 
-    enhanced_vgg = vgg.net(vgg_dir, vgg.preprocess(enhanced * 255))
-    dslr_vgg = vgg.net(vgg_dir, vgg.preprocess(dslr_ * 255))
+        # -------------------------------------------
+        # Processing: Level 1,  Input size: 128 x 128
+        conv_l1_d9 = conv_l1_d1
+        conv_l1_d10 = stack(_conv_multi_block(conv_l1_d9, 3, num_maps=num_maps_base, instance_norm=False), conv_t2b)
+        conv_l1_d11 = stack(conv_l1_d10, conv_l1_d1)
+        conv_l1_d12 = _conv_multi_block(conv_l1_d11, 3, num_maps=num_maps_base, instance_norm=False)
 
-    content_size = utils._tensor_size(dslr_vgg[CONTENT_LAYER]) * batch_size
-    loss_content = 2 * tf.nn.l2_loss(enhanced_vgg[CONTENT_LAYER] - dslr_vgg[CONTENT_LAYER]) / content_size
+        # ----------------------------------------------------------
+        # Processing: Level 0 (x2 upscaling),  Input size: 128 x 128
+        conv_l0 = _conv_tranpose_layer(conv_l1_d12, num_maps_base//4, 3, 2)        # 128 -> 256
+        conv_l0_out = _conv_layer(conv_l0, 3, 3, 1, relu=False, instance_norm=False)
 
-    # Final loss function
-    loss_generator = loss_mse * 20 + loss_content + (1 - loss_ssim) * 20
+        output_l0 = tf.nn.tanh(conv_l0_out) * 0.58 + 0.5
+        
+    output_l0 = tf.identity(output_l0, name='output_l0')
 
-    # Optimize network parameters
-    generator_vars = [v for v in tf.compat.v1.global_variables() if v.name.startswith("generator")]
-    train_step_gen = tf.compat.v1.train.AdamOptimizer(learning_rate).minimize(loss_generator, var_list=generator_vars)
+    return output_l0, layer_name
 
-    # Initialize and restore the variables
-    print("Initializing variables...")
-    sess.run(tf.compat.v1.global_variables_initializer())
 
-    saver = tf.compat.v1.train.Saver(var_list=generator_vars, max_to_keep=100)
+def _conv_multi_block(input, max_size, num_maps, instance_norm):
 
-    if restore_iter > 0: # restore the variables/weights
-        name_model_restore = name_model
+    conv_3a = _conv_layer(input, num_maps, 3, 1, relu=True, instance_norm=instance_norm)
+    conv_3b = _conv_layer(conv_3a, num_maps, 3, 1, relu=True, instance_norm=instance_norm)
 
-        name_model_restore_full = name_model_restore + "_iteration_" + str(restore_iter)
-        print("Restoring Variables from:", name_model_restore_full)
-        saver.restore(sess, model_dir + name_model_restore_full + ".ckpt")
+    output_tensor = conv_3b
 
-    # Loading training and validation data
-    print("Loading validation data...")
-    val_data, val_answ = load_val_data(dataset_dir, dslr_dir, phone_dir, PATCH_WIDTH, PATCH_HEIGHT, DSLR_SCALE)
-    print("Validation data was loaded\n")
+    if max_size >= 5:
 
-    print("Loading training data...")
-    train_data, train_answ = load_train_patch(dataset_dir, dslr_dir, phone_dir, train_size, PATCH_WIDTH, PATCH_HEIGHT, DSLR_SCALE)
-    print("Training data was loaded\n")
+        conv_5a = _conv_layer(input, num_maps, 5, 1, relu=True, instance_norm=instance_norm)
+        conv_5b = _conv_layer(conv_5a, num_maps, 5, 1, relu=True, instance_norm=instance_norm)
 
-    VAL_SIZE = val_data.shape[0]
-    num_val_batches = int(val_data.shape[0] / batch_size)
+        output_tensor = stack(output_tensor, conv_5b)
 
-    if save_mid_imgs:
-        visual_crops_ids = np.random.randint(0, VAL_SIZE, batch_size)
-        visual_val_crops = val_data[visual_crops_ids, :]
-        visual_target_crops = val_answ[visual_crops_ids, :]
+    if max_size >= 7:
 
-    print("Training network...")
+        conv_7a = _conv_layer(input, num_maps, 7, 1, relu=True, instance_norm=instance_norm)
+        conv_7b = _conv_layer(conv_7a, num_maps, 7, 1, relu=True, instance_norm=instance_norm)
 
-    iter_start = restore_iter+1 if restore_iter > 0 else 0
-    logs = open(model_dir + "logs_" + str(iter_start) + "-" + str(num_train_iters) + ".txt", "w+")
-    logs.close()
+        output_tensor = stack(output_tensor, conv_7b)
 
-    training_loss = 0.0
+    if max_size >= 9:
 
-    name_model_save = name_model
-    
-    for i in range(iter_start, num_train_iters + 1):
-        name_model_save_full = name_model_save + "_iteration_" + str(i)
+        conv_9a = _conv_layer(input, num_maps, 9, 1, relu=True, instance_norm=instance_norm)
+        conv_9b = _conv_layer(conv_9a, num_maps, 9, 1, relu=True, instance_norm=instance_norm)
 
-        # Train model
-        idx_train = np.random.randint(0, train_size, batch_size)
+        output_tensor = stack(output_tensor, conv_9b)
 
-        phone_images = train_data[idx_train]
-        dslr_images = train_answ[idx_train]
+    return output_tensor
 
-        # Data augmentation: random flips and rotations
-        for k in range(batch_size):
 
-            random_rotate = np.random.randint(1, 100) % 4
-            phone_images[k] = np.rot90(phone_images[k], random_rotate)
-            dslr_images[k] = np.rot90(dslr_images[k], random_rotate)
-            random_flip = np.random.randint(1, 100) % 2
+def stack(x, y):
+    return tf.concat([x, y], 3)
 
-            if random_flip == 1:
-                phone_images[k] = np.flipud(phone_images[k])
-                dslr_images[k] = np.flipud(dslr_images[k])
 
-        # Training step
-        [loss_temp, temp] = sess.run([loss_generator, train_step_gen], feed_dict={phone_: phone_images, dslr_: dslr_images})
-        training_loss += loss_temp / eval_step
+def conv2d(x, W):
+    return tf.nn.conv2d(x, W, strides=[1, 1, 1, 1], padding='SAME')
 
-        if i % 200 == 0:
 
-            # Evaluate model
-            val_losses = np.zeros((1, 5))
+def _conv_layer(net, num_filters, filter_size, strides, relu=True, instance_norm=False, padding='SAME'):
+    weights_init = _conv_init_vars(net, num_filters, filter_size)
+    strides_shape = [1, strides, strides, 1]
+    bias = tf.Variable(tf.constant(0.01, shape=[num_filters]))
+    global layer_name
+    layer_name += 1
+    net = tf.nn.conv2d(net, weights_init, strides_shape, padding=padding, name=str(layer_name)) + bias
 
-            for j in range(num_val_batches):
+    if instance_norm:
+        net = _instance_norm(net)
 
-                be = j * batch_size
-                en = (j+1) * batch_size
+    if relu:
+        net = tf.compat.v1.nn.leaky_relu(net)
 
-                phone_images = val_data[be:en]
-                dslr_images = val_answ[be:en]
+    return net
 
-                losses = sess.run([loss_generator, loss_content, loss_mse, loss_psnr, loss_ms_ssim], \
-                                    feed_dict={phone_: phone_images, dslr_: dslr_images})
 
-                val_losses += np.asarray(losses) / num_val_batches
+def _instance_norm(net):
 
-            logs_gen = "step %d | training: %.4g, validation: %.4g | content: %.4g, mse: %.4g, psnr: %.4g, " \
-                           "ms-ssim: %.4g\n" % (i, training_loss, val_losses[0][0], val_losses[0][1],
-                                                val_losses[0][2], val_losses[0][3], val_losses[0][4])
-            print(logs_gen)
+    batch, rows, cols, channels = [i.value for i in net.get_shape()]
+    var_shape = [channels]
 
-            # Save the results to log file
-            logs = open(model_dir + "logs_" + str(iter_start) + "-" + str(num_train_iters) + ".txt", "a")
-            logs.write(logs_gen)
-            logs.write('\n')
-            logs.close()
+    mu, sigma_sq = tf.nn.moments(net, [1,2], keep_dims=True)
+    shift = tf.Variable(tf.zeros(var_shape))
+    scale = tf.Variable(tf.ones(var_shape))
 
-            # Optional: save visual results for several validation image crops
-            if save_mid_imgs:
-                enhanced_crops = sess.run(enhanced, feed_dict={phone_: visual_val_crops, dslr_: dslr_images})
+    epsilon = 1e-3
+    normalized = (net-mu)/(sigma_sq + epsilon)**(.5)
 
-                idx = 0
-                for crop in enhanced_crops:
-                    if idx < 4:
-                        before_after = np.hstack((crop,
-                                        np.reshape(visual_target_crops[idx], [TARGET_HEIGHT, TARGET_WIDTH, TARGET_DEPTH])))
-                        imageio.imwrite(result_dir + name_model_save_full + "_img_" + str(idx) + ".jpg",
-                                        before_after)
-                    idx += 1
+    return scale * normalized + shift
 
-            # Saving the model that corresponds to the current iteration
-            saver.save(sess, model_dir + name_model_save_full + ".ckpt", write_meta_graph=False)
 
-            training_loss = 0.0
+def _conv_init_vars(net, out_channels, filter_size, transpose=False):
 
-        # Loading new training data
-        if i % 1000 == 0:
+    _, rows, cols, in_channels = [i.value for i in net.get_shape()]
 
-            del train_data
-            del train_answ
-            train_data, train_answ = load_train_patch(dataset_dir, dslr_dir, phone_dir, train_size, PATCH_WIDTH, PATCH_HEIGHT, DSLR_SCALE)
+    if not transpose:
+        weights_shape = [filter_size, filter_size, in_channels, out_channels]
+    else:
+        weights_shape = [filter_size, filter_size, out_channels, in_channels]
 
-    # printing out psnr
-    print(val_losses[0][4])
-    print('total train/eval time:', datetime.now() - time_start)
+    weights_init = tf.Variable(tf.random.truncated_normal(weights_shape, stddev=0.01, seed=1), dtype=tf.float32)
+    return weights_init
+
+
+def _conv_tranpose_layer(net, num_filters, filter_size, strides):
+    weights_init = _conv_init_vars(net, num_filters, filter_size, transpose=True)
+
+    batch_size, rows, cols, in_channels = [i.value for i in net.get_shape()]
+    new_rows, new_cols = int(rows * strides), int(cols * strides)
+
+    new_shape = [batch_size, new_rows, new_cols, num_filters]
+    tf_shape = tf.stack(new_shape)
+
+    strides_shape = [1, strides, strides, 1]
+    net = tf.nn.conv2d_transpose(net, weights_init, tf_shape, strides_shape, padding='SAME')
+
+    return tf.compat.v1.nn.leaky_relu(net)
+
+
+def max_pool(x, n):
+    return tf.nn.max_pool(x, ksize=[1, n, n, 1], strides=[1, n, n, 1], padding='VALID')
