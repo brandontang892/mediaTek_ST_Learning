@@ -9,7 +9,7 @@ import numpy as np
 layer_name = 0
 
 def PUNET(input, instance_norm=False, instance_norm_level_1=False, num_maps_base=16):
-
+    global layer_name
     with tf.compat.v1.variable_scope("generator"):
 
         # -----------------------------------------
@@ -72,7 +72,7 @@ def PUNET(input, instance_norm=False, instance_norm_level_1=False, num_maps_base
         
     output_l0 = tf.identity(output_l0, name='output_l0')
 
-    return output_l0
+    return output_l0, layer_name
 
 
 def _conv_multi_block(input, max_size, num_maps, instance_norm):
