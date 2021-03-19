@@ -13,6 +13,7 @@ from load_dataset import load_train_patch, load_val_data
 from model import PUNET
 import utils
 import vgg
+import operator
 
 # Processing command arguments
 dataset_dir, model_dir, result_dir, vgg_dir, dslr_dir, phone_dir,\
@@ -31,8 +32,11 @@ TARGET_SIZE = TARGET_WIDTH * TARGET_HEIGHT * TARGET_DEPTH
 
 np.random.seed(0)
 
+g = tf.Graph()
+
 # Defining the model architecture
-with tf.Graph().as_default(), tf.compat.v1.Session() as sess:
+with g.as_default(), tf.compat.v1.Session() as sess:
+    num_layers = 0
     time_start = datetime.now()
 
     # mirrored_strategy = tf.distribute.MirroredStrategy()
@@ -46,7 +50,7 @@ with tf.Graph().as_default(), tf.compat.v1.Session() as sess:
 
     # Get the processed enhanced image
     if arch == "punet":
-        enhanced = PUNET(phone_, instance_norm=inst_norm, instance_norm_level_1=False, num_maps_base=num_maps_base)
+        enhanced, num_layers = PUNET(phone_, instance_norm=inst_norm, instance_norm_level_1=False, num_maps_base=num_maps_base)
 
     # Losses
     enhanced_flat = tf.reshape(enhanced, [-1, TARGET_SIZE])
@@ -191,6 +195,25 @@ with tf.Graph().as_default(), tf.compat.v1.Session() as sess:
             saver.save(sess, model_dir + name_model_save_full + ".ckpt", write_meta_graph=False)
 
             training_loss = 0.0
+
+        # Prune filters every 200 iterations, up until the 1000th iteration (200, 400, 600, 800, 1000)
+        if (i+1) % 200 == 0 and i < 1000:
+            for name in range(1, num_layers+1):
+                layer_weights = g.get_tensor_by_name(str(name))
+                num_total = len(layer_weights)
+
+                # Prune 5% of filters from each layer when doing structured filter pruning on some epoch
+                num_prune = round(num_total * 0.05)
+                print(num_prune, num_total, 0.05)
+        
+                l1_norm_filters = []
+                for i in range(num_total):
+                    l1_norm_filters.append((tf.math.reduce_sum(layer_weights[i,:,:,:]).numpy(), i))
+
+                # Sort based on absolute weight sum of each filter while keeping track of which filter is which
+                l1_norm_filters.sort(key = operator.itemgetter(0))
+                for j in range(num_prune):  
+                    sess.run(tf.assign(layer_weights[l1_norm_filters[j][1],:,:,:], tf.multiply(layer_weights[l1_norm_filters[j][1],:,:,:], 0))) # Setting the filters in given layer in the model to zero.
 
         # Loading new training data
         if i % 1000 == 0:
