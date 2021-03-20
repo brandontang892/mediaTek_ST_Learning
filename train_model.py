@@ -195,20 +195,24 @@ with g.as_default(), tf.compat.v1.Session() as sess:
             saver.save(sess, model_dir + name_model_save_full + ".ckpt", write_meta_graph=False)
 
             training_loss = 0.0
+            
+        all_names = [op.name for op in sess.graph.get_operations()]
+        print(all_names)
 
         # Prune filters every 200 iterations, up until the 1000th iteration (200, 400, 600, 800, 1000)
         if (i+1) % 200 == 0 and i < 1000:
             for name in range(1, num_layers+1):
+                print("Number of filters in layer ", name, ": ", num_total)
                 layer_weights = g.get_tensor_by_name(str(name))
                 num_total = len(layer_weights)
 
                 # Prune 5% of filters from each layer when doing structured filter pruning on some epoch
                 num_prune = round(num_total * 0.05)
-                print(num_prune, num_total, 0.05)
+                #print(num_prune, num_total, 0.05)
         
                 l1_norm_filters = []
-                for i in range(num_total):
-                    l1_norm_filters.append((tf.math.reduce_sum(layer_weights[i,:,:,:]).numpy(), i))
+                for k in range(num_total):
+                    l1_norm_filters.append((tf.math.reduce_sum(layer_weights[k,:,:,:]).numpy(), k))
 
                 # Sort based on absolute weight sum of each filter while keeping track of which filter is which
                 l1_norm_filters.sort(key = operator.itemgetter(0))
