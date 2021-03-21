@@ -51,7 +51,7 @@ with g.as_default(), tf.compat.v1.Session() as sess:
     # Get the processed enhanced image
     if arch == "punet":
         enhanced, num_layers = PUNET(phone_, instance_norm=inst_norm, instance_norm_level_1=False, num_maps_base=num_maps_base)
-
+    
     # Losses
     enhanced_flat = tf.reshape(enhanced, [-1, TARGET_SIZE])
     dslr_flat = tf.reshape(dslr_, [-1, TARGET_SIZE])
@@ -96,7 +96,7 @@ with g.as_default(), tf.compat.v1.Session() as sess:
         name_model_restore_full = name_model_restore + "_iteration_" + str(restore_iter)
         print("Restoring Variables from:", name_model_restore_full)
         saver.restore(sess, model_dir + name_model_restore_full + ".ckpt")
-
+        
     # Loading training and validation data
     print("Loading validation data...")
     val_data, val_answ = load_val_data(dataset_dir, dslr_dir, phone_dir, PATCH_WIDTH, PATCH_HEIGHT, DSLR_SCALE)
@@ -195,30 +195,43 @@ with g.as_default(), tf.compat.v1.Session() as sess:
             saver.save(sess, model_dir + name_model_save_full + ".ckpt", write_meta_graph=False)
 
             training_loss = 0.0
+           
             
-        all_names = [op.name for op in sess.graph.get_operations()]
-        print(all_names)
-
         # Prune filters every 200 iterations, up until the 1000th iteration (200, 400, 600, 800, 1000)
         if (i+1) % 200 == 0 and i < 1000:
-            for name in range(1, num_layers+1):
-                print("Number of filters in layer ", name, ": ", num_total)
-                layer_weights = g.get_tensor_by_name(str(name))
-                num_total = len(layer_weights)
-
-                # Prune 5% of filters from each layer when doing structured filter pruning on some epoch
-                num_prune = round(num_total * 0.05)
-                #print(num_prune, num_total, 0.05)
-        
-                l1_norm_filters = []
-                for k in range(num_total):
-                    l1_norm_filters.append((tf.math.reduce_sum(layer_weights[k,:,:,:]).numpy(), k))
-
+            # Even number name is layer weights, odd number name is layer bias
+            #layer_weights_ref_test = tf.get_collection('trainable_variables', 'generator/Variable_2:0')[0]
+            #layer_weights_test = layer_weights_ref_test.eval()
+            #print("__________________________________________________________________________________________________")
+            #print(layer_weights_test)
+            
+            for name in range(2, num_layers, 2):
+                layer_weights_ref = tf.get_collection('trainable_variables', 'generator/Variable_' + str(name) + ':0')[0]
+                layer_weights = layer_weights_ref.eval()
+                layer_bias_ref = tf.get_collection('trainable_variables', 'generator/Variable_' + str(name+1) + ':0')[0]
+                layer_bias = layer_bias_ref.eval()
+                
+                #Prune 5% of filters from each layer when doing structured filter pruning on some epoch
+                num_total = layer_weights.shape[3]
+                num_prune = round( num_total * 0.05 * (1 + (i // 200)) )
+                print("Number of pruned filters: ", num_prune, "Original number of filters in this layer: ", num_total, "Prune Percentage: ", 0.05)
+                
                 # Sort based on absolute weight sum of each filter while keeping track of which filter is which
-                l1_norm_filters.sort(key = operator.itemgetter(0))
-                for j in range(num_prune):  
-                    sess.run(tf.assign(layer_weights[l1_norm_filters[j][1],:,:,:], tf.multiply(layer_weights[l1_norm_filters[j][1],:,:,:], 0))) # Setting the filters in given layer in the model to zero.
+                l1_norm_filters = tf.math.reduce_sum(layer_weights, [0, 1, 2]).eval()
+                l1_idxs = sorted(range(len(l1_norm_filters)), key=lambda k: l1_norm_filters[k])
 
+                for j in range(num_prune):  
+                    sess.run(tf.assign(layer_weights_ref[:,:,:,l1_idxs[j]], tf.zeros(layer_weights[:,:,:,l1_idxs[j]].shape)))
+                    sess.run(tf.assign(layer_bias_ref[l1_idxs[j]], tf.zeros(layer_bias[l1_idxs[j]].shape)))
+                # Setting the filters in given layer in the model to zero.
+                
+            #print("__________________________________________________________________________________________________")
+            
+            #layer_weights_ref_test = tf.get_collection('trainable_variables', 'generator/Variable_2:0')[0]
+            #layer_weights_test = layer_weights_ref_test.eval()
+            #print(layer_weights_test)
+            
+                
         # Loading new training data
         if i % 1000 == 0:
 
